@@ -13,7 +13,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 # Locate directories relative to this test file
 TESTS_DIR = Path(__file__).parent
@@ -87,6 +87,15 @@ def _make_anthropic_response(text: str = "Hello from Anthropic"):
     return resp
 
 
+def _make_stream_chunks(parts: list[str]):
+    chunks = []
+    for part in parts:
+        chunk = MagicMock()
+        chunk.text = part
+        chunks.append(chunk)
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Test Cases
 # ---------------------------------------------------------------------------
@@ -106,6 +115,24 @@ class TestCallOpenAI(unittest.TestCase):
         self.assertEqual(usage["input_tokens"], 10)
         self.assertEqual(usage["output_tokens"], 20)
 
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai-key"})
+    @patch("openai.OpenAI")
+    def test_openai_sends_expected_chat_params(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _make_openai_response()
+
+        call_openai("Hello", model="gpt-4o-mini", temperature=0.2, top_p=0.8, max_tokens=64)
+
+        self.assertEqual(MockOpenAI.call_args.kwargs.get("api_key"), "test-openai-key")
+        mock_client.chat.completions.create.assert_called_once()
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        self.assertIn(kwargs["model"], {"gpt-4o-mini", "openai/gpt-4o-mini"})
+        self.assertEqual(kwargs["messages"], [{"role": "user", "content": "Hello"}])
+        self.assertEqual(kwargs["temperature"], 0.2)
+        self.assertEqual(kwargs["top_p"], 0.8)
+        self.assertEqual(kwargs["max_tokens"], 64)
+
 
 class TestCallGemini(unittest.TestCase):
 
@@ -122,6 +149,26 @@ class TestCallGemini(unittest.TestCase):
         self.assertGreaterEqual(latency, 0.0)
         self.assertEqual(usage["input_tokens"], 12)
         self.assertEqual(usage["output_tokens"], 25)
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test-gemini-key"})
+    @patch("google.genai.Client")
+    def test_gemini_sends_expected_generate_content_params(self, MockGenAIClient):
+        mock_client = MagicMock()
+        MockGenAIClient.return_value = mock_client
+        mock_client.models.generate_content.return_value = _make_gemini_response()
+
+        call_gemini("Hello", model=_m.GEMINI_MODEL, temperature=0.1, top_p=0.5, max_tokens=32)
+
+        MockGenAIClient.assert_called_once_with(api_key="test-gemini-key")
+        mock_client.models.generate_content.assert_called_once()
+        kwargs = mock_client.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["model"], _m.GEMINI_MODEL)
+        self.assertEqual(kwargs["contents"], "Hello")
+        self.assertIn("config", kwargs)
+        config = kwargs["config"]
+        self.assertEqual(config.temperature, 0.1)
+        self.assertEqual(config.top_p, 0.5)
+        self.assertEqual(config.max_output_tokens, 32)
 
 
 class TestCallAnthropic(unittest.TestCase):
@@ -140,13 +187,30 @@ class TestCallAnthropic(unittest.TestCase):
         self.assertEqual(usage["input_tokens"], 15)
         self.assertEqual(usage["output_tokens"], 30)
 
+    @patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-anthropic-key"})
+    @patch("anthropic.Anthropic")
+    def test_anthropic_sends_expected_message_params(self, MockAnthropic):
+        mock_client = MagicMock()
+        MockAnthropic.return_value = mock_client
+        mock_client.messages.create.return_value = _make_anthropic_response()
+
+        call_anthropic("Hello", model="claude-3-5-haiku", temperature=0.3, top_p=0.7, max_tokens=48)
+
+        MockAnthropic.assert_called_once_with(api_key="test-anthropic-key")
+        kwargs = mock_client.messages.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "claude-3-5-haiku")
+        self.assertEqual(kwargs["messages"], [{"role": "user", "content": "Hello"}])
+        self.assertEqual(kwargs["temperature"], 0.3)
+        self.assertEqual(kwargs["top_p"], 0.7)
+        self.assertEqual(kwargs["max_tokens"], 48)
+
 
 class TestCompareModels(unittest.TestCase):
 
     def test_compare_models_evaluates_correct_costs(self):
         with patch.object(_m, "call_openai") as mock_openai, \
              patch.object(_m, "call_gemini") as mock_gemini:
-             
+
             # Setup mock returns
             mock_openai.side_effect = [
                 ("GPT-4o Response", 0.5, {"input_tokens": 10, "output_tokens": 20}),       # 1st call: gpt-4o
@@ -165,13 +229,31 @@ class TestCompareModels(unittest.TestCase):
             self.assertIn("gpt4o_mini", result)
             self.assertIn("gemini_flash", result)
 
+            # Verify models were called in the expected order
+            self.assertEqual(mock_openai.call_count, 2)
+            openai_models = [
+                c.kwargs.get("model", c.args[1] if len(c.args) > 1 else None)
+                for c in mock_openai.call_args_list
+            ]
+            self.assertEqual(openai_models[0], "gpt-4o")
+            self.assertEqual(openai_models[1], "gpt-4o-mini")
+            gemini_kwargs = mock_gemini.call_args.kwargs
+            if "model" in gemini_kwargs:
+                self.assertEqual(gemini_kwargs["model"], _m.GEMINI_MODEL)
+
+            # Verify payload fields
+            self.assertEqual(result["gpt4o"]["response"], "GPT-4o Response")
+            self.assertEqual(result["gpt4o"]["latency"], 0.5)
+            self.assertEqual(result["gpt4o"]["input_tokens"], 10)
+            self.assertEqual(result["gpt4o"]["output_tokens"], 20)
+
             # Verify exact cost calculations
             # gpt-4o: (10 * 5.0 + 20 * 20.0) / 1,000,000 = 0.00045
             self.assertAlmostEqual(result["gpt4o"]["cost"], 0.00045, places=8)
-            
+
             # gpt-4o-mini: (10 * 0.150 + 20 * 0.600) / 1,000,000 = 0.0000135
             self.assertAlmostEqual(result["gpt4o_mini"]["cost"], 0.0000135, places=8)
-            
+
             # gemini-2.5-flash: (10 * 0.075 + 20 * 0.300) / 1,000,000 = 0.00000675
             self.assertAlmostEqual(result["gemini_flash"]["cost"], 0.00000675, places=8)
 
@@ -202,12 +284,28 @@ class TestRetryWithBackoff(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             retry_with_backoff(permanent_fail, max_retries=2, base_delay=0.001)
 
+    @patch(f"{_m.__name__}.time.sleep")
+    def test_uses_exponential_backoff_delays(self, mock_sleep):
+        state = {"attempts": 0}
+
+        def flaky_fn():
+            state["attempts"] += 1
+            if state["attempts"] < 3:
+                raise ValueError("Fail")
+            return "ok"
+
+        retry_with_backoff(flaky_fn, max_retries=3, base_delay=0.1)
+
+        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertAlmostEqual(mock_sleep.call_args_list[0].args[0], 0.1)
+        self.assertAlmostEqual(mock_sleep.call_args_list[1].args[0], 0.2)
+
 
 class TestBatchCompareAndFormat(unittest.TestCase):
 
     def test_batch_runs_and_formats_table(self):
         with patch.object(_m, "compare_models") as mock_comp:
-            def _get_mock():
+            def _get_mock(*_args, **_kwargs):
                 return {
                     "gpt4o": {"response": "GPT-4o response content here", "latency": 0.5, "cost": 0.00045, "input_tokens": 10, "output_tokens": 20},
                     "gpt4o_mini": {"response": "GPT-4o-Mini response content here", "latency": 0.3, "cost": 0.0000135, "input_tokens": 10, "output_tokens": 20},
@@ -218,6 +316,8 @@ class TestBatchCompareAndFormat(unittest.TestCase):
             results = batch_compare(["Q1", "Q2"])
             self.assertEqual(len(results), 2)
             self.assertEqual(results[0]["prompt"], "Q1")
+            self.assertEqual(results[1]["prompt"], "Q2")
+            self.assertEqual(mock_comp.call_args_list, [call("Q1"), call("Q2")])
 
             table = format_comparison_table(results)
             self.assertIsInstance(table, str)
@@ -225,6 +325,21 @@ class TestBatchCompareAndFormat(unittest.TestCase):
             self.assertIn("GPT-4o", table)
             self.assertIn("Gemini-Flash", table)
             self.assertIn("Q1", table)
+            self.assertIn("Latency", table)
+            self.assertIn("Tokens (In/Out)", table)
+            self.assertIn("Cost (USD)", table)
+
+    def test_format_table_truncates_long_responses(self):
+        long_response = "A" * 80
+        results = [{
+            "prompt": "Long",
+            "gpt4o": {"response": long_response, "latency": 0.5, "cost": 0.1, "input_tokens": 1, "output_tokens": 2},
+            "gpt4o_mini": {"response": "short", "latency": 0.3, "cost": 0.01, "input_tokens": 1, "output_tokens": 2},
+            "gemini_flash": {"response": "short", "latency": 0.4, "cost": 0.001, "input_tokens": 1, "output_tokens": 2},
+        }]
+        table = format_comparison_table(results)
+        self.assertIn("A" * 50 + "...", table)
+        self.assertNotIn("A" * 51, table)
 
 
 class TestStreamingChatbot(unittest.TestCase):
@@ -237,6 +352,47 @@ class TestStreamingChatbot(unittest.TestCase):
             streaming_chatbot()
         except SystemExit:
             pass
+        MockClient.return_value.models.generate_content_stream.assert_not_called()
+
+    @patch("builtins.print")
+    @patch("builtins.input", side_effect=["hello", "exit"])
+    @patch("google.genai.Client")
+    def test_streams_response_chunks(self, MockClient, mock_input, mock_print):
+        mock_client = MagicMock()
+        MockClient.return_value = mock_client
+        mock_client.models.generate_content_stream.return_value = _make_stream_chunks(["Xin ", "chao"])
+
+        streaming_chatbot()
+
+        mock_client.models.generate_content_stream.assert_called_once()
+        kwargs = mock_client.models.generate_content_stream.call_args.kwargs
+        self.assertEqual(kwargs["model"], _m.GEMINI_MODEL)
+        printed = "".join(
+            str(c.args[0]) if c.args else ""
+            for c in mock_print.call_args_list
+        )
+        self.assertIn("Xin ", printed)
+        self.assertIn("chao", printed)
+
+    @patch("builtins.print")
+    @patch("builtins.input", side_effect=["t1", "t2", "t3", "t4", "quit"])
+    @patch("google.genai.Client")
+    def test_keeps_only_last_three_turns(self, MockClient, mock_input, mock_print):
+        mock_client = MagicMock()
+        MockClient.return_value = mock_client
+        mock_client.models.generate_content_stream.return_value = _make_stream_chunks(["ok"])
+
+        streaming_chatbot()
+
+        self.assertEqual(mock_client.models.generate_content_stream.call_count, 4)
+        last_contents = mock_client.models.generate_content_stream.call_args_list[-1].kwargs["contents"]
+        self.assertLessEqual(len(last_contents), 6)
+        user_texts = [
+            msg["parts"][0]["text"]
+            for msg in last_contents
+            if msg.get("role") == "user"
+        ]
+        self.assertEqual(user_texts, ["t2", "t3", "t4"])
 
 
 if __name__ == "__main__":
